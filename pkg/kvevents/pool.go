@@ -519,14 +519,10 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	}
 
 	for _, tag := range batch.SkippedTags {
-		if tag == string(EventTypeRecoveryUnitStored) || tag == string(EventTypeRecoveryUnitRemoved) {
-			logger.V(logging.TRACE).Info("Skipped unsupported recovery event", "eventType", tag, "podIdentifier", podID)
-			continue
-		}
 		label := metrics.RecordUnknownTagSkipped(tag)
 		_, inMap := p.loggedUnknownTags.LoadOrStore(label, struct{}{})
 		if !inMap {
-			logger.Info("Skipping KV events with an unknown tag",
+			logger.Info("Skipping unsupported KV events",
 				"tag", label, "podIdentifier", podID, "modelName", modelName)
 		}
 	}

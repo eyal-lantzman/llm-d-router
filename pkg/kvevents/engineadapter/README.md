@@ -53,9 +53,11 @@ Consumers receive cause and tier strings verbatim.
 
 The adapter delivers valid events in wire order and records unsupported
 recovery events in `EventBatch.SkippedTags`. This includes positional recovery
-arrays and malformed recovery maps. An unreadable MessagePack boundary still
-fails the batch. A consumer that requires complete checkpoint history can
-return an error on a skipped recovery tag to reset its source. The block index
+arrays and malformed maps with an identifiable recovery tag. The pool counts
+these tags in `llm_d_epp_kv_cache_events_unknown_tags_skipped_total`. An
+unreadable MessagePack boundary still fails the batch. A consumer that requires
+complete checkpoint history can return an error on a skipped recovery tag
+to reset its source. The block index
 logs recovery events at trace verbosity and indexes the surrounding block
 events. Consumers must also handle `AllBlocksCleared` and endpoint resets.
 
