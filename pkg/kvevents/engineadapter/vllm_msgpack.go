@@ -37,18 +37,19 @@ const maxDecodePreallocate = 1024
 // Limit recursive values in extra_keys to protect the goroutine stack.
 const maxDecodeDepth = 64
 
-// Limit hash processing because only the final bytes contribute to the hash.
+// Maximum binary hash length accepted on the wire. Block hashes use the low
+// bytes as an index key. Recovery unit keys retain every byte.
 const maxDecodeHashBytes = 64
 
-// unknownTypedEventTagError carries the skipped tag to the batch decoder. It is
+// skippedEventTagError carries the skipped tag to the batch decoder. It is
 // returned only after all fields of the event are consumed, so a batch decoder
 // can continue with the next event.
-type unknownTypedEventTagError struct {
+type skippedEventTagError struct {
 	tag string
 }
 
-func (e *unknownTypedEventTagError) Error() string {
-	return "unknown typed event tag: " + e.tag
+func (e *skippedEventTagError) Error() string {
+	return "skipped event tag: " + e.tag
 }
 
 type eventWireSchema struct {
@@ -59,8 +60,9 @@ type eventWireSchema struct {
 	storedFields         []eventFieldDecoder
 	removedFields        []eventFieldDecoder
 	storedEvent          func(*typedEventFields) *kvevents.BlockStoredEvent
+	// recoveryUnits enables the vLLM tagged-map recovery event schema.
+	recoveryUnits bool
 	// skipUnknownTags drops events with an unknown tag instead of rejecting the batch.
-	recoveryUnits    bool
 	skipUnknownTags  bool
 	unknownTagPrefix string
 }
@@ -102,10 +104,9 @@ func (b *msgpackTypedEventBatch) DecodeMsgpack(dec *msgpack.Decoder) error {
 		b.events = make([]kvevents.GenericEvent, 0, min(eventCount, maxDecodePreallocate))
 		for range eventCount {
 			event, err := decodeTypedEventFromDecoder(dec, b.schema)
-			// Skip events with tags this adapter does not know so the rest of
-			// the batch still reaches the index.
-			if unknown, ok := errors.AsType[*unknownTypedEventTagError](err); ok {
-				b.skippedTags = append(b.skippedTags, unknown.tag)
+			// A skipped event has already been consumed through its wire boundary.
+			if skipped, ok := errors.AsType[*skippedEventTagError](err); ok {
+				b.skippedTags = append(b.skippedTags, skipped.tag)
 				continue
 			}
 			if err != nil {
@@ -181,14 +182,6 @@ func decodeArrayTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kveve
 		return nil, err
 	}
 
-	if isRecoveryUnitTag(tag, schema) {
-		fields, err := decodeArrayFields(dec, fieldCount, tag, schema)
-		if err != nil {
-			return nil, err
-		}
-		return fields.recovery.event(tag, fields.sessionID)
-	}
-
 	switch tag {
 	case eventTagBlockStored:
 		return decodeArrayBlockStored(dec, fieldCount, schema)
@@ -206,7 +199,7 @@ func decodeArrayTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kveve
 		if err := skipFields(dec, fieldCount-1); err != nil {
 			return nil, err
 		}
-		return nil, &unknownTypedEventTagError{tag: tag}
+		return nil, &skippedEventTagError{tag: tag}
 	}
 }
 
@@ -259,9 +252,6 @@ func typedFieldDecoders(tag string, schema *eventWireSchema) []eventFieldDecoder
 
 func decodeArrayFields(dec *msgpack.Decoder, fieldCount int, tag string, schema *eventWireSchema) (*typedEventFields, error) {
 	fields := &typedEventFields{}
-	if isRecoveryUnitTag(tag, schema) {
-		fields.recovery = &recoveryFields{}
-	}
 	decoders := typedFieldDecoders(tag, schema)
 	knownCount := min(fieldCount-1, len(decoders))
 	for _, field := range decoders[:knownCount] {
@@ -410,12 +400,40 @@ func decodeBoundedRaw(dec *msgpack.Decoder, name string) ([]byte, error) {
 }
 
 func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevents.GenericEvent, error) {
+	var fields typedEventFields
+	if !schema.recoveryUnits {
+		return decodeTypedMapFields(dec, schema, &fields)
+	}
+
+	// ParseMessage supplies an in-memory payload. Keep its cursor so a malformed
+	// recovery event can be consumed from its boundary, even after a partial read.
+	reader, ok := dec.Buffered().(*bytes.Reader)
+	if !ok {
+		raw, err := decodeBoundedRaw(dec, "")
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(raw)
+		dec = msgpack.NewDecoder(reader)
+	}
+	start := *reader
+	event, err := decodeTypedMapFields(dec, schema, &fields)
+	if err == nil || fields.recovery == nil {
+		return event, err
+	}
+	*reader = start
+	if err := skipValue(dec); err != nil {
+		return nil, err
+	}
+	return nil, &skippedEventTagError{tag: fields.tag}
+}
+
+func decodeTypedMapFields(dec *msgpack.Decoder, schema *eventWireSchema, fields *typedEventFields) (kvevents.GenericEvent, error) {
 	fieldCount, err := dec.DecodeMapLen()
 	if err != nil {
 		return nil, err
 	}
 
-	fields := typedEventFields{}
 	// Buffer fields before the tag because the tag defines their schema.
 	var deferred []rawTypedMapField
 	for range fieldCount {
@@ -436,7 +454,7 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 			}
 			if err == nil && isKnownEventTag(fields.tag, schema) {
 				for _, field := range deferred {
-					if err := decodeTypedMapField(msgpack.NewDecoder(bytes.NewReader(field.value)), field.name, fields.tag, &fields, schema); err != nil {
+					if err := decodeTypedMapField(msgpack.NewDecoder(bytes.NewReader(field.value)), field.name, fields.tag, fields, schema); err != nil {
 						return nil, fmt.Errorf("map-encoded event field %q: %w", field.name, err)
 					}
 				}
@@ -468,7 +486,7 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 			}
 			deferred = append(deferred, rawTypedMapField{name: name, value: value})
 		case isKnownEventTag(fields.tag, schema):
-			err = decodeTypedMapField(dec, name, fields.tag, &fields, schema)
+			err = decodeTypedMapField(dec, name, fields.tag, fields, schema)
 		default:
 			err = skipValue(dec)
 		}
@@ -490,7 +508,7 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 		if err := fields.requireBlockStoredFields(); err != nil {
 			return nil, err
 		}
-		return schema.storedEvent(&fields), nil
+		return schema.storedEvent(fields), nil
 	case eventTagBlockRemoved:
 		if !fields.hasHashes {
 			return nil, fmt.Errorf("BlockRemoved: missing required field %q", "block_hashes")
@@ -502,7 +520,7 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 		if !schema.skipUnknownTags {
 			return nil, fmt.Errorf("%s: %s", schema.unknownTagPrefix, fields.tag)
 		}
-		return nil, &unknownTypedEventTagError{tag: fields.tag}
+		return nil, &skippedEventTagError{tag: fields.tag}
 	}
 }
 

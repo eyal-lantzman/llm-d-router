@@ -519,6 +519,10 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	}
 
 	for _, tag := range batch.SkippedTags {
+		if tag == string(EventTypeRecoveryUnitStored) || tag == string(EventTypeRecoveryUnitRemoved) {
+			logger.V(logging.TRACE).Info("Skipped unsupported recovery event", "eventType", tag, "podIdentifier", podID)
+			continue
+		}
 		label := metrics.RecordUnknownTagSkipped(tag)
 		_, inMap := p.loggedUnknownTags.LoadOrStore(label, struct{}{})
 		if !inMap {
@@ -1079,6 +1083,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 		case *RecoveryUnitStoredEvent, *RecoveryUnitRemovedEvent:
 			// Checkpoints have no canonical token span to add to the block index.
+			log.FromContext(ctx).V(logging.TRACE).Info("Block index ignored recovery event", "eventType", genericEvent.Type(), "podIdentifier", podIdentifier)
 			continue
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)

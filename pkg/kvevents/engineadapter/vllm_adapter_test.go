@@ -730,7 +730,7 @@ func TestVLLMUnknownTag(t *testing.T) {
 	event, err := adapter.decodeVLLMEvent(rawBytes)
 	assert.Error(t, err)
 	assert.Nil(t, event)
-	var unknown *unknownTypedEventTagError
+	var unknown *skippedEventTagError
 	require.ErrorAs(t, err, &unknown)
 	assert.Equal(t, "UnknownEventType", unknown.tag)
 }
@@ -1464,10 +1464,10 @@ func TestTypedBatchRequiresExplicitSchema(t *testing.T) {
 
 func TestVLLMRecoveryUnitsInMixedBatch(t *testing.T) {
 	events := []any{
-		[]any{"RecoveryUnitStored", []byte{1, 2, 3}, 1451, true, "session"},
+		recoveryMap(t, "unit_hash", []byte{1, 2, 3}, "session_id", "session", "num_tokens", 1451, "frontier", true, "type", "RecoveryUnitStored"),
 		[]any{"BlockRemoved", []uint64{91}},
-		[]any{"RecoveryUnitRemoved", []byte{1, 2, 3}, 1451, true, "superseded", "leaf", 2},
-		[]any{"RecoveryUnitStored", uint64(math.MaxUint64), 1408, false},
+		recoveryMap(t, "type", "RecoveryUnitRemoved", "unit_hash", []byte{1, 2, 3}, "num_tokens", 1451, "frontier", true, "cause", "superseded", "tier", "leaf", "num_blocks", 2),
+		recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", uint64(math.MaxUint64), "num_tokens", 1408, "frontier", false),
 		[]any{"AllBlocksCleared"},
 	}
 	payload, err := msgpack.Marshal([]any{1.0, events, 3})
@@ -1510,23 +1510,72 @@ func TestVLLMRecoveryUnitMap(t *testing.T) {
 	require.Equal(t, "leaf", *removed.Tier)
 	require.Nil(t, removed.NumBlocks)
 
-	for _, invalid := range []any{
-		[]any{"RecoveryUnitStored", uint64(1), 1408},
-		[]any{"RecoveryUnitStored", nil, 1408, true},
-		[]any{"RecoveryUnitStored", []byte{}, 1408, true},
-		[]any{"RecoveryUnitStored", make([]byte, maxDecodeHashBytes+1), 1408, true},
-		[]any{"RecoveryUnitStored", uint64(1), -1, true},
-		[]any{"RecoveryUnitStored", uint64(1), 1408, nil},
-		[]any{"RecoveryUnitRemoved", uint64(1), 1408, false},
-		map[string]any{"type": "RecoveryUnitRemoved", "unit_hash": 1, "cause": "orphan", "frontier": false},
-	} {
-		payload, err := msgpack.Marshal(invalid)
-		require.NoError(t, err)
-		_, err = NewVLLMAdapter().decodeVLLMEvent(payload)
-		require.Error(t, err)
-	}
 	payload, err := msgpack.Marshal([]any{1.0, []any{[]any{"RecoveryUnitStored", uint64(1), 1408, false}}, 0})
 	require.NoError(t, err)
 	_, _, _, err = NewSGLangAdapter().ParseMessage(&kvevents.RawMessage{Payload: payload})
 	require.Error(t, err)
+}
+
+func recoveryMap(t *testing.T, fields ...any) msgpack.RawMessage {
+	t.Helper()
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	require.NoError(t, enc.EncodeMapLen(len(fields)/2))
+	require.NoError(t, enc.EncodeMulti(fields...))
+	return buf.Bytes()
+}
+
+func TestVLLMMalformedRecoveryPreservesAdjacentBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name, tag string
+		event     any
+	}{
+		{"missing frontier", "RecoveryUnitStored", recoveryMap(t, "type", "RecoveryUnitStored", "num_tokens", 19, "unit_hash", 1)},
+		{"string count before tag", "RecoveryUnitStored", recoveryMap(t, "num_tokens", "19", "type", "RecoveryUnitStored", "frontier", true, "unit_hash", 1)},
+		{"oversized hash", "RecoveryUnitStored", recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", make([]byte, maxDecodeHashBytes+1), "num_tokens", 19, "frontier", true)},
+		{"empty hash", "RecoveryUnitStored", recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", []byte{}, "num_tokens", 19, "frontier", true)},
+		{"nil hash", "RecoveryUnitStored", recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", nil, "num_tokens", 19, "frontier", true)},
+		{"negative count", "RecoveryUnitStored", recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", 1, "num_tokens", -1, "frontier", true)},
+		{"missing cause", "RecoveryUnitRemoved", recoveryMap(t, "frontier", false, "unit_hash", 1, "num_tokens", 19, "type", "RecoveryUnitRemoved")},
+		{"string hash", "RecoveryUnitRemoved", recoveryMap(t, "type", "RecoveryUnitRemoved", "unit_hash", "key", "num_tokens", 19, "frontier", false, "cause", "orphan")},
+		{"invalid nested value", "RecoveryUnitRemoved", recoveryMap(t, "type", "RecoveryUnitRemoved", "frontier", []any{1, 2}, "cause", "orphan")},
+		{"unversioned positional stored", "RecoveryUnitStored", []any{"RecoveryUnitStored", 1, 19, true, "session"}},
+		{"unversioned positional removed", "RecoveryUnitRemoved", []any{"RecoveryUnitRemoved", 1, 19, false, "future-field", "orphan", "leaf", 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := []any{"BlockStored", []uint64{11}, nil, []int{1}, 1}
+			after := []any{"BlockStored", []uint64{22}, nil, []int{2}, 1}
+			payload, err := msgpack.Marshal([]any{1.0, []any{before, tc.event, after}, 3})
+			require.NoError(t, err)
+			_, _, batch, err := NewVLLMAdapter().ParseMessage(&kvevents.RawMessage{Payload: payload})
+			require.NoError(t, err)
+			require.Equal(t, []string{tc.tag}, batch.SkippedTags)
+			require.Len(t, batch.Events, 2)
+			require.Equal(t, []uint64{11}, batch.Events[0].(*kvevents.BlockStoredEvent).BlockHashes)
+			require.Equal(t, []uint64{22}, batch.Events[1].(*kvevents.BlockStoredEvent).BlockHashes)
+			require.Equal(t, 3, *batch.DataParallelRank)
+		})
+	}
+}
+
+func TestVLLMTruncatedRecoveryStillFailsBatch(t *testing.T) {
+	bad := recoveryMap(t, "type", "RecoveryUnitStored", "num_tokens", "wrong", "unit_hash", []byte{1, 2, 3})
+	payload, err := msgpack.Marshal([]any{1.0, []any{bad}})
+	require.NoError(t, err)
+	_, _, _, err = NewVLLMAdapter().ParseMessage(&kvevents.RawMessage{Payload: payload[:len(payload)-1]})
+	require.Error(t, err)
+}
+
+func TestVLLMStreamedRecoverySkipKeepsNextEvent(t *testing.T) {
+	events := []any{
+		recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", "wrong", "frontier", true, "num_tokens", 3),
+		recoveryMap(t, "type", "RecoveryUnitStored", "unit_hash", 17, "frontier", true, "num_tokens", 3),
+	}
+	wire, err := msgpack.Marshal([]any{1.0, events})
+	require.NoError(t, err)
+	batch := msgpackTypedEventBatch{schema: &vllmWireSchema}
+	require.NoError(t, msgpack.NewDecoder(bytes.NewBuffer(wire)).Decode(&batch))
+	require.Equal(t, []string{"RecoveryUnitStored"}, batch.skippedTags)
+	require.Len(t, batch.events, 1)
+	require.Equal(t, uint64(17), batch.events[0].(*kvevents.RecoveryUnitStoredEvent).UnitHash.Integer)
 }

@@ -59,8 +59,8 @@ type EventBatch struct {
 	Timestamp        float64
 	Events           []GenericEvent
 	DataParallelRank *int
-	// SkippedTags holds the tag of each event the adapter dropped because it
-	// does not know the tag.
+	// SkippedTags lists each skipped tag in wire order, including unrecognized
+	// tags and vLLM recovery events with unsupported payloads.
 	SkippedTags []string
 }
 
@@ -172,9 +172,12 @@ type RecoveryUnitHash struct {
 type RecoveryUnit struct {
 	UnitHash  RecoveryUnitHash
 	NumTokens int
-	Frontier  bool
+	// Frontier marks the exact request endpoint inside a block. A false value
+	// identifies a checkpoint at a block boundary.
+	Frontier bool
 }
 
+// RecoveryUnitStoredEvent reports newly resumable state on the publishing engine.
 type RecoveryUnitStoredEvent struct {
 	RecoveryUnit
 	SessionID *string
@@ -182,10 +185,13 @@ type RecoveryUnitStoredEvent struct {
 
 func (*RecoveryUnitStoredEvent) Type() EventType { return EventTypeRecoveryUnitStored }
 
+// RecoveryUnitRemovedEvent reports why state stopped being resumable.
 type RecoveryUnitRemovedEvent struct {
 	RecoveryUnit
-	Cause     string
-	Tier      *string
+	Cause string
+	// Tier is the unit's last eviction ranking, if the producer ranked it.
+	Tier *string
+	// NumBlocks is set when the eviction selected this unit and freed blocks.
 	NumBlocks *int
 }
 

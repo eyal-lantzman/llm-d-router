@@ -26,11 +26,38 @@ replica of a model server can run with the same arguments.
 `NewAdapter` selects the adapter registered for a given engine type
 (`kvEventsConfig.engineType`).
 
-When vLLM publishes hybrid checkpoint events, event consumers receive
-`RecoveryUnitStoredEvent` and `RecoveryUnitRemovedEvent` in wire order.
-The hash identifies state on the publishing engine. The block index ignores
-these events because its keys describe spans of token IDs. A consumer tracking
-checkpoints must also handle cache clears and endpoint resets.
+### vLLM recovery checkpoints
+
+The vLLM producer in [PR #67160](https://github.com/vllm-project/vllm/pull/67160)
+publishes an array-shaped batch containing tagged MessagePack **maps**.
+The adapter follows the [event definitions](https://github.com/ischencheng/vllm/blob/4ffb2a4b3a5c9a1cdae88262ed1ec35e6f88665d/vllm/distributed/kv_events.py#L148-L207)
+and the [checkpoint publisher](https://github.com/ischencheng/vllm/blob/4ffb2a4b3a5c9a1cdae88262ed1ec35e6f88665d/vllm/v1/core/hybrid_checkpoint/manager.py#L269-L320).
+
+| Event tag (`type`) | Required fields (any key order) | Optional fields |
+| --- | --- | --- |
+| `RecoveryUnitStored` | `unit_hash`, `num_tokens`, `frontier` | `session_id` |
+| `RecoveryUnitRemoved` | `unit_hash`, `num_tokens`, `frontier`, `cause` | `tier`, `num_blocks` |
+
+`unit_hash` identifies recurrent state on the publishing engine. The producer
+uses a binary or integer hash. The adapter retains every byte of binary keys
+up to 64 bytes. `num_tokens` gives the resumable prefix length.
+`frontier: true` identifies a request's exact endpoint inside a block. A false
+value identifies a block boundary.
+
+On removal, `cause` describes why the state disappeared. The producer defines
+`evicted-dead`, `evicted-interior`, `evicted-leaf`, `evicted-unranked`,
+`orphan`, `superseded`, `frontier`, `replaced` and `allocation`. The optional
+`tier` gives the last eviction ranking (`dead`, `interior` or `leaf`).
+`num_blocks` counts blocks freed when the eviction selected that unit.
+Consumers receive cause and tier strings verbatim.
+
+The adapter delivers valid events in wire order and records unsupported
+recovery events in `EventBatch.SkippedTags`. This includes positional recovery
+arrays and malformed recovery maps. An unreadable MessagePack boundary still
+fails the batch. A consumer that requires complete checkpoint history can
+return an error on a skipped recovery tag to reset its source. The block index
+logs recovery events at trace verbosity and indexes the surrounding block
+events. Consumers must also handle `AllBlocksCleared` and endpoint resets.
 
 ## Adding an engine
 
