@@ -28,8 +28,11 @@ replica of a model server can run with the same arguments.
 
 ### vLLM recovery checkpoints
 
-The vLLM producer in [PR #67160](https://github.com/vllm-project/vllm/pull/67160)
-publishes an array-shaped batch containing tagged MessagePack **maps**.
+The recovery wire format comes from an unmerged vLLM draft,
+[PR #67160](https://github.com/vllm-project/vllm/pull/67160), stacked on
+[#66881](https://github.com/vllm-project/vllm/pull/66881). It can change before
+merge. The draft producer publishes an array-shaped batch containing tagged
+MessagePack **maps**.
 The adapter follows the [event definitions](https://github.com/ischencheng/vllm/blob/4ffb2a4b3a5c9a1cdae88262ed1ec35e6f88665d/vllm/distributed/kv_events.py#L148-L207)
 and the [checkpoint publisher](https://github.com/ischencheng/vllm/blob/4ffb2a4b3a5c9a1cdae88262ed1ec35e6f88665d/vllm/v1/core/hybrid_checkpoint/manager.py#L269-L320).
 
