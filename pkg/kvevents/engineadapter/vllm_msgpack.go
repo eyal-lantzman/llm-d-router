@@ -60,6 +60,7 @@ type eventWireSchema struct {
 	removedFields        []eventFieldDecoder
 	storedEvent          func(*typedEventFields) *kvevents.BlockStoredEvent
 	// skipUnknownTags drops events with an unknown tag instead of rejecting the batch.
+	recoveryUnits    bool
 	skipUnknownTags  bool
 	unknownTagPrefix string
 }
@@ -180,6 +181,14 @@ func decodeArrayTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kveve
 		return nil, err
 	}
 
+	if isRecoveryUnitTag(tag, schema) {
+		fields, err := decodeArrayFields(dec, fieldCount, tag, schema)
+		if err != nil {
+			return nil, err
+		}
+		return fields.recovery.event(tag, fields.sessionID)
+	}
+
 	switch tag {
 	case eventTagBlockStored:
 		return decodeArrayBlockStored(dec, fieldCount, schema)
@@ -232,6 +241,12 @@ var vllmBlockRemovedFieldDecoders = []eventFieldDecoder{
 }
 
 func typedFieldDecoders(tag string, schema *eventWireSchema) []eventFieldDecoder {
+	if isRecoveryUnitTag(tag, schema) {
+		if tag == string(kvevents.EventTypeRecoveryUnitStored) {
+			return recoveryStoredFields
+		}
+		return recoveryRemovedFields
+	}
 	switch tag {
 	case eventTagBlockStored:
 		return schema.storedFields
@@ -244,6 +259,9 @@ func typedFieldDecoders(tag string, schema *eventWireSchema) []eventFieldDecoder
 
 func decodeArrayFields(dec *msgpack.Decoder, fieldCount int, tag string, schema *eventWireSchema) (*typedEventFields, error) {
 	fields := &typedEventFields{}
+	if isRecoveryUnitTag(tag, schema) {
+		fields.recovery = &recoveryFields{}
+	}
 	decoders := typedFieldDecoders(tag, schema)
 	knownCount := min(fieldCount-1, len(decoders))
 	for _, field := range decoders[:knownCount] {
@@ -315,6 +333,7 @@ func decodeBlockSizeField(dec *msgpack.Decoder, fields *typedEventFields) error 
 }
 
 type typedEventFields struct {
+	recovery       *recoveryFields
 	sessionID      *string
 	locality       string
 	ownership      string
@@ -412,7 +431,10 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 			}
 			fields.tag, err = decodeMapEventTag(dec)
 			fields.hasTag = err == nil
-			if err == nil && isKnownVLLMEventTag(fields.tag) {
+			if isRecoveryUnitTag(fields.tag, schema) {
+				fields.recovery = &recoveryFields{}
+			}
+			if err == nil && isKnownEventTag(fields.tag, schema) {
 				for _, field := range deferred {
 					if err := decodeTypedMapField(msgpack.NewDecoder(bytes.NewReader(field.value)), field.name, fields.tag, &fields, schema); err != nil {
 						return nil, fmt.Errorf("map-encoded event field %q: %w", field.name, err)
@@ -428,6 +450,14 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 					break
 				}
 			}
+			if !knownField && schema.recoveryUnits {
+				for _, field := range recoveryRemovedFields {
+					if field.name == name {
+						knownField = true
+						break
+					}
+				}
+			}
 			if !knownField {
 				err = skipValue(dec)
 				break
@@ -437,7 +467,7 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 				return nil, fmt.Errorf("map-encoded event field %q: %w", name, decodeErr)
 			}
 			deferred = append(deferred, rawTypedMapField{name: name, value: value})
-		case isKnownVLLMEventTag(fields.tag):
+		case isKnownEventTag(fields.tag, schema):
 			err = decodeTypedMapField(dec, name, fields.tag, &fields, schema)
 		default:
 			err = skipValue(dec)
@@ -449,6 +479,10 @@ func decodeMapTypedEvent(dec *msgpack.Decoder, schema *eventWireSchema) (kvevent
 
 	if !fields.hasTag {
 		return nil, fmt.Errorf("map-encoded event is missing the %q tag", "type")
+	}
+
+	if fields.recovery != nil {
+		return fields.recovery.event(fields.tag, fields.sessionID)
 	}
 
 	switch fields.tag {
@@ -487,12 +521,12 @@ func decodeTypedMapField(
 	return skipValue(dec)
 }
 
-func isKnownVLLMEventTag(tag string) bool {
+func isKnownEventTag(tag string, schema *eventWireSchema) bool {
 	switch tag {
 	case eventTagBlockStored, eventTagBlockRemoved, eventTagAllBlocksCleared:
 		return true
 	default:
-		return false
+		return isRecoveryUnitTag(tag, schema)
 	}
 }
 

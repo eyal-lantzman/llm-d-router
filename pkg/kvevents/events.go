@@ -30,7 +30,9 @@ const (
 	// EventTypeBlockRemoved indicates blocks were evicted from cache.
 	EventTypeBlockRemoved EventType = "BlockRemoved"
 	// EventTypeAllBlocksCleared indicates entire cache was cleared.
-	EventTypeAllBlocksCleared EventType = "AllBlocksCleared"
+	EventTypeAllBlocksCleared    EventType = "AllBlocksCleared"
+	EventTypeRecoveryUnitStored  EventType = "RecoveryUnitStored"
+	EventTypeRecoveryUnitRemoved EventType = "RecoveryUnitRemoved"
 )
 
 const (
@@ -158,3 +160,33 @@ type AllBlocksClearedEvent struct {
 func (e *AllBlocksClearedEvent) Type() EventType {
 	return EventTypeAllBlocksCleared
 }
+
+// RecoveryUnitHash preserves the producer's full binary or integer checkpoint key.
+// Bytes is nonempty for binary keys. Both forms are comparable as Go map keys.
+type RecoveryUnitHash struct {
+	Integer uint64
+	Bytes   string
+}
+
+// RecoveryUnit identifies a resumable recurrent checkpoint on one engine.
+type RecoveryUnit struct {
+	UnitHash  RecoveryUnitHash
+	NumTokens int
+	Frontier  bool
+}
+
+type RecoveryUnitStoredEvent struct {
+	RecoveryUnit
+	SessionID *string
+}
+
+func (*RecoveryUnitStoredEvent) Type() EventType { return EventTypeRecoveryUnitStored }
+
+type RecoveryUnitRemovedEvent struct {
+	RecoveryUnit
+	Cause     string
+	Tier      *string
+	NumBlocks *int
+}
+
+func (*RecoveryUnitRemovedEvent) Type() EventType { return EventTypeRecoveryUnitRemoved }

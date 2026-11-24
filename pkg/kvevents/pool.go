@@ -1077,6 +1077,9 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 			p.clearPod(ctx, podIdentifier, false)
 
+		case *RecoveryUnitStoredEvent, *RecoveryUnitRemovedEvent:
+			// Checkpoints have no canonical token span to add to the block index.
+			continue
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}

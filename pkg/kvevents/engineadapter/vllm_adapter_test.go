@@ -1461,3 +1461,72 @@ func TestTypedBatchRequiresExplicitSchema(t *testing.T) {
 	batch.schema = &sglangWireSchema
 	require.ErrorContains(t, msgpack.Unmarshal(payload, &batch), "SGLang event batch: need at least 3 fields")
 }
+
+func TestVLLMRecoveryUnitsInMixedBatch(t *testing.T) {
+	events := []any{
+		[]any{"RecoveryUnitStored", []byte{1, 2, 3}, 1451, true, "session"},
+		[]any{"BlockRemoved", []uint64{91}},
+		[]any{"RecoveryUnitRemoved", []byte{1, 2, 3}, 1451, true, "superseded", "leaf", 2},
+		[]any{"RecoveryUnitStored", uint64(math.MaxUint64), 1408, false},
+		[]any{"AllBlocksCleared"},
+	}
+	payload, err := msgpack.Marshal([]any{1.0, events, 3})
+	require.NoError(t, err)
+	_, _, batch, err := NewVLLMAdapter().ParseMessage(&kvevents.RawMessage{Payload: payload})
+	require.NoError(t, err)
+	require.Empty(t, batch.SkippedTags)
+	require.Len(t, batch.Events, len(events))
+	stored := batch.Events[0].(*kvevents.RecoveryUnitStoredEvent)
+	require.Equal(t, "\x01\x02\x03", stored.UnitHash.Bytes)
+	require.Equal(t, 1451, stored.NumTokens)
+	require.True(t, stored.Frontier)
+	require.Equal(t, "session", *stored.SessionID)
+	require.IsType(t, &kvevents.BlockRemovedEvent{}, batch.Events[1])
+	removed := batch.Events[2].(*kvevents.RecoveryUnitRemovedEvent)
+	require.Equal(t, stored.UnitHash, removed.UnitHash)
+	require.Equal(t, "superseded", removed.Cause)
+	require.Equal(t, "leaf", *removed.Tier)
+	require.Equal(t, 2, *removed.NumBlocks)
+	boundary := batch.Events[3].(*kvevents.RecoveryUnitStoredEvent)
+	require.False(t, boundary.Frontier)
+	require.Nil(t, boundary.SessionID)
+	require.Equal(t, uint64(math.MaxUint64), boundary.UnitHash.Integer)
+	require.IsType(t, &kvevents.AllBlocksClearedEvent{}, batch.Events[4])
+}
+
+func TestVLLMRecoveryUnitMap(t *testing.T) {
+	full := append([]byte{12}, make([]byte, 32)...)
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	require.NoError(t, enc.EncodeMapLen(7))
+	require.NoError(t, enc.EncodeMulti("num_blocks", nil, "tier", "leaf", "unit_hash", full, "cause", "evicted-leaf", "num_tokens", 1004, "frontier", true, "type", "RecoveryUnitRemoved"))
+	event, err := NewVLLMAdapter().decodeVLLMEvent(buf.Bytes())
+	require.NoError(t, err)
+	removed := event.(*kvevents.RecoveryUnitRemovedEvent)
+	require.Equal(t, string(full), removed.UnitHash.Bytes)
+	require.Equal(t, 1004, removed.NumTokens)
+	require.True(t, removed.Frontier)
+	require.Equal(t, "evicted-leaf", removed.Cause)
+	require.Equal(t, "leaf", *removed.Tier)
+	require.Nil(t, removed.NumBlocks)
+
+	for _, invalid := range []any{
+		[]any{"RecoveryUnitStored", uint64(1), 1408},
+		[]any{"RecoveryUnitStored", nil, 1408, true},
+		[]any{"RecoveryUnitStored", []byte{}, 1408, true},
+		[]any{"RecoveryUnitStored", make([]byte, maxDecodeHashBytes+1), 1408, true},
+		[]any{"RecoveryUnitStored", uint64(1), -1, true},
+		[]any{"RecoveryUnitStored", uint64(1), 1408, nil},
+		[]any{"RecoveryUnitRemoved", uint64(1), 1408, false},
+		map[string]any{"type": "RecoveryUnitRemoved", "unit_hash": 1, "cause": "orphan", "frontier": false},
+	} {
+		payload, err := msgpack.Marshal(invalid)
+		require.NoError(t, err)
+		_, err = NewVLLMAdapter().decodeVLLMEvent(payload)
+		require.Error(t, err)
+	}
+	payload, err := msgpack.Marshal([]any{1.0, []any{[]any{"RecoveryUnitStored", uint64(1), 1408, false}}, 0})
+	require.NoError(t, err)
+	_, _, _, err = NewSGLangAdapter().ParseMessage(&kvevents.RawMessage{Payload: payload})
+	require.Error(t, err)
+}

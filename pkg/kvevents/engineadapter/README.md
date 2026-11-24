@@ -26,6 +26,12 @@ replica of a model server can run with the same arguments.
 `NewAdapter` selects the adapter registered for a given engine type
 (`kvEventsConfig.engineType`).
 
+When vLLM publishes hybrid checkpoint events, event consumers receive
+`RecoveryUnitStoredEvent` and `RecoveryUnitRemovedEvent` in wire order.
+The hash identifies state on the publishing engine. The block index ignores
+these events because its keys describe spans of token IDs. A consumer tracking
+checkpoints must also handle cache clears and endpoint resets.
+
 ## Adding an engine
 
 vLLM and SGLang register their adapters in this package. An engine with its own
