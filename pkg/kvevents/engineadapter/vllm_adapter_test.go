@@ -19,6 +19,8 @@ package engineadapter //nolint:testpackage // Tests access unexported functions
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -26,6 +28,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1588,6 +1591,52 @@ func TestVLLMRecoveryProducerReplay(t *testing.T) {
 		kvevents.EventTypeRecoveryUnitStored:  92,
 		kvevents.EventTypeRecoveryUnitRemoved: 80,
 	}, counts)
+}
+
+func TestVLLMRecoveryHashVectors(t *testing.T) {
+	encoder, err := cbor.CanonicalEncOptions().EncMode()
+	require.NoError(t, err)
+	digest := func(t *testing.T, v any) []byte {
+		t.Helper()
+		b, err := encoder.Marshal(v)
+		require.NoError(t, err)
+		sum := sha256.Sum256(b)
+		return sum[:]
+	}
+
+	for _, form := range []string{"binary", "integer"} {
+		t.Run(form, func(t *testing.T) {
+			data, err := os.ReadFile("testdata/vllm_recovery_" + form + ".msgpack")
+			require.NoError(t, err)
+			var vector struct {
+				Tokens []int  `msgpack:"tokens"`
+				Batch  []byte `msgpack:"batch"`
+			}
+			require.NoError(t, msgpack.Unmarshal(data, &vector))
+			_, _, batch, err := NewVLLMAdapter().ParseMessage(&kvevents.RawMessage{Payload: vector.Batch})
+			require.NoError(t, err)
+			require.Len(t, batch.Events, 2)
+			require.GreaterOrEqual(t, len(vector.Tokens), 104)
+
+			parent := digest(t, []any{digest(t, "3031"), vector.Tokens[:64], [][]any{{"cache_salt", "tenant"}}})
+			frontier := digest(t, []any{parent, vector.Tokens[64:104], [][]any{{"mamba-frontier-checkpoint", 104}}})
+			for i, want := range []struct {
+				hash     []byte
+				depth    int
+				frontier bool
+			}{{parent, 64, false}, {frontier, 104, true}} {
+				event, ok := batch.Events[i].(*kvevents.RecoveryUnitStoredEvent)
+				require.True(t, ok)
+				assert.Equal(t, want.depth, event.NumTokens)
+				assert.Equal(t, want.frontier, event.Frontier)
+				key := kvevents.RecoveryUnitHash{Bytes: string(want.hash)}
+				if form == "integer" {
+					key = kvevents.RecoveryUnitHash{Integer: binary.BigEndian.Uint64(want.hash[sha256.Size-8:])}
+				}
+				assert.Equal(t, key, event.UnitHash)
+			}
+		})
+	}
 }
 
 func TestVLLMMalformedRecoveryPreservesAdjacentBlocks(t *testing.T) {

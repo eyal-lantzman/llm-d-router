@@ -92,6 +92,28 @@ replay before updating the pin. In a running router, rising skipped-tag counts
 for `tag="RecoveryUnitStored"` or `tag="RecoveryUnitRemoved"` indicate recovery
 payloads the adapter could not decode.
 
+### Matching a checkpoint hash
+
+For text prompts, an independent consumer can match the pinned producer's
+`sha256_cbor` checkpoints when the engine and consumer agree on the hash seed,
+block size, token IDs and cache salt. A frontier also includes the residual
+tokens and the checkpoint depth. The binary wire form carries the full digest.
+The integer form carries its low 64 bits. vLLM's pickle-based `sha256` setting
+produces different keys. Consumers that credit resident checkpoints must also
+observe removals and cache resets for that endpoint.
+
+The two synthetic test vectors contain a salted 64-token block and a 104-token
+frontier from the same request. To regenerate them in the pinned producer
+environment, reuse `fixture_dir` from the replay instructions above.
+
+```sh
+for entry in '0 binary' '1 integer'; do
+    set -- $entry
+    PYTHONHASHSEED=3031 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES="$1" PYTHONPATH="$PWD" \
+        python "$fixture_dir/generate_recovery_hash_vector.py" "$fixture_dir/vllm_recovery_$2.msgpack"
+done
+```
+
 ## Adding an engine
 
 vLLM and SGLang register their adapters in this package. An engine with its own
