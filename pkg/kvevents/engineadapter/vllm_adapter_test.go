@@ -18,9 +18,12 @@ package engineadapter //nolint:testpackage // Tests access unexported functions
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"slices"
 	"testing"
 
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
@@ -1523,6 +1526,68 @@ func recoveryMap(t *testing.T, fields ...any) msgpack.RawMessage {
 	require.NoError(t, enc.EncodeMapLen(len(fields)/2))
 	require.NoError(t, enc.EncodeMulti(fields...))
 	return buf.Bytes()
+}
+
+func TestVLLMRecoveryProducerReplay(t *testing.T) {
+	compressed, err := os.ReadFile("testdata/vllm_recovery.msgpack.gz")
+	require.NoError(t, err)
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	require.NoError(t, err)
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	var frames [][]byte
+	require.NoError(t, msgpack.Unmarshal(data, &frames))
+	require.Len(t, frames, 74)
+
+	adapter := NewVLLMAdapter()
+	counts := map[kvevents.EventType]int{}
+	for i, wire := range frames {
+		t.Run(fmt.Sprintf("batch-%02d", i), func(t *testing.T) {
+			_, _, clean, err := adapter.ParseMessage(&kvevents.RawMessage{Payload: wire})
+			require.NoError(t, err)
+			require.Empty(t, clean.SkippedTags)
+			require.Equal(t, float64(i), clean.Timestamp)
+			require.NotNil(t, clean.DataParallelRank)
+			require.Equal(t, i/37, *clean.DataParallelRank)
+
+			var batch, events []msgpack.RawMessage
+			require.NoError(t, msgpack.Unmarshal(wire, &batch))
+			require.Len(t, batch, 3)
+			require.NoError(t, msgpack.Unmarshal(batch[1], &events))
+			require.Len(t, clean.Events, len(events))
+			for j, raw := range events {
+				var header struct {
+					Type kvevents.EventType `msgpack:"type"`
+				}
+				require.NoError(t, msgpack.Unmarshal(raw, &header))
+				require.Equal(t, header.Type, clean.Events[j].Type())
+				counts[header.Type]++
+			}
+
+			// Keep the producer's event bytes intact on both sides of the insertion.
+			tag := string(kvevents.EventTypeRecoveryUnitStored)
+			if i%2 == 1 {
+				tag = string(kvevents.EventTypeRecoveryUnitRemoved)
+			}
+			bad := recoveryMap(t, "type", tag, "frontier", true, "unit_hash", 1, "num_tokens", "invalid")
+			events = slices.Insert(events, len(events)/2, bad)
+			batch[1], err = msgpack.Marshal(events)
+			require.NoError(t, err)
+			mixed, err := msgpack.Marshal(batch)
+			require.NoError(t, err)
+			_, _, got, err := adapter.ParseMessage(&kvevents.RawMessage{Payload: mixed})
+			require.NoError(t, err)
+			clean.SkippedTags = []string{tag}
+			require.Equal(t, clean, got)
+		})
+	}
+	require.Equal(t, map[kvevents.EventType]int{
+		kvevents.EventTypeBlockStored:         216,
+		kvevents.EventTypeBlockRemoved:        494,
+		kvevents.EventTypeRecoveryUnitStored:  92,
+		kvevents.EventTypeRecoveryUnitRemoved: 80,
+	}, counts)
 }
 
 func TestVLLMMalformedRecoveryPreservesAdjacentBlocks(t *testing.T) {

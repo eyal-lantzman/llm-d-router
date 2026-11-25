@@ -64,6 +64,34 @@ to reset its source. The block index
 logs recovery events at trace verbosity and indexes the surrounding block
 events. Consumers must also handle `AllBlocksCleared` and endpoint resets.
 
+#### Replay the vLLM producer fixture
+
+`go test ./pkg/kvevents/engineadapter -run '^TestVLLMRecoveryProducerReplay$'`
+replays 74 captured batches from two CPU schedulers. The producer's test helpers
+generate synthetic token IDs and model outputs. The fixture wraps the original
+MessagePack payloads in a gzipped MessagePack array of byte strings.
+The test decodes each frame and repeats it with a malformed recovery map inserted
+between events. It checks the skipped tag, event order and contents, timestamp,
+and data-parallel rank.
+
+To regenerate, use a vLLM checkout at the
+[pinned producer revision](https://github.com/ischencheng/vllm/commit/4ffb2a4b3a5c9a1cdae88262ed1ec35e6f88665d)
+with its test dependencies and the `facebook/opt-125m` test configuration
+available. From the router repository root, set `VLLM_CHECKOUT` to that checkout
+and run in its Python environment:
+
+```sh
+fixture_dir="$PWD/pkg/kvevents/engineadapter/testdata"
+cd "$VLLM_CHECKOUT"
+PYTHONHASHSEED=0 PYTHONPATH="$PWD" python "$fixture_dir/generate_vllm_recovery.py" \
+  "$fixture_dir/vllm_recovery.msgpack.gz"
+```
+
+When the producer schema changes, regenerate from that revision and run the
+replay before updating the pin. In a running router, rising skipped-tag counts
+for `tag="RecoveryUnitStored"` or `tag="RecoveryUnitRemoved"` indicate recovery
+payloads the adapter could not decode.
+
 ## Adding an engine
 
 vLLM and SGLang register their adapters in this package. An engine with its own
